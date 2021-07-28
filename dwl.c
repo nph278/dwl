@@ -2,6 +2,7 @@
  * See LICENSE file for copyright and license details.
  */
 #define _POSIX_C_SOURCE 200809L
+#include <assert.h>
 #include <getopt.h>
 #include <linux/input-event-codes.h>
 #include <signal.h>
@@ -29,8 +30,10 @@
 #include <wlr/types/wlr_output_layout.h>
 #include <wlr/types/wlr_output_management_v1.h>
 #include <wlr/types/wlr_pointer.h>
+#include <wlr/types/wlr_pointer_constraints_v1.h>
 #include <wlr/types/wlr_primary_selection.h>
 #include <wlr/types/wlr_primary_selection_v1.h>
+#include <wlr/types/wlr_relative_pointer_v1.h>
 #include <wlr/types/wlr_screencopy_v1.h>
 #include <wlr/types/wlr_server_decoration.h>
 #include <wlr/types/wlr_seat.h>
@@ -84,6 +87,7 @@ typedef struct {
 	const Arg arg;
 } Button;
 
+typedef struct Pertag Pertag;
 typedef struct Monitor Monitor;
 typedef struct {
 	struct wl_list link;
@@ -173,6 +177,7 @@ struct Monitor {
 	struct wlr_box w;      /* window area, layout-relative */
 	struct wl_list layers[4]; // LayerSurface::link
 	const Layout *lt[2];
+	Pertag *pertag;
 	unsigned int seltags;
 	unsigned int sellt;
 	unsigned int tagset[2];
@@ -190,6 +195,14 @@ typedef struct {
 	int x;
 	int y;
 } MonitorRule;
+
+struct pointer_constraint {
+	struct wlr_pointer_constraint_v1 *constraint;
+
+	struct wl_listener set_region;
+	struct wl_listener destroy;
+};
+
 
 typedef struct {
 	const char *id;
@@ -231,15 +244,18 @@ static void createmon(struct wl_listener *listener, void *data);
 static void createnotify(struct wl_listener *listener, void *data);
 static void createlayersurface(struct wl_listener *listener, void *data);
 static void createpointer(struct wlr_input_device *device);
+static void createpointerconstraint(struct wl_listener *listener, void *data);
 static void cursorframe(struct wl_listener *listener, void *data);
 static void destroylayersurfacenotify(struct wl_listener *listener, void *data);
 static void destroynotify(struct wl_listener *listener, void *data);
+static void destroypointerconstraint(struct wl_listener *listener, void *data);
 static Monitor *dirtomon(enum wlr_direction dir);
 static void focusclient(Client *c, int lift);
 static void focusmon(const Arg *arg);
 static void focusstack(const Arg *arg);
 static void fullscreennotify(struct wl_listener *listener, void *data);
 static Client *focustop(Monitor *m);
+static void handleconstraintcommit(struct wl_listener *listener, void *data);
 static void incnmaster(const Arg *arg);
 static void inputdevice(struct wl_listener *listener, void *data);
 static int keybinding(uint32_t mods, xkb_keysym_t sym);
@@ -337,6 +353,11 @@ static struct wlr_box sgeom;
 static struct wl_list mons;
 static Monitor *selmon;
 
+struct wlr_pointer_constraints_v1 *pointer_constraints;
+struct wlr_pointer_constraint_v1 *active_constraint;
+static struct wl_listener constraint_commit;
+struct wlr_relative_pointer_manager_v1 *relative_pointer_manager;
+
 /* global event handlers */
 static struct wl_listener cursor_axis = {.notify = axisnotify};
 static struct wl_listener cursor_button = {.notify = buttonpress};
@@ -348,6 +369,7 @@ static struct wl_listener new_input = {.notify = inputdevice};
 static struct wl_listener new_virtual_keyboard = {.notify = virtualkeyboard};
 static struct wl_listener new_output = {.notify = createmon};
 static struct wl_listener new_xdg_surface = {.notify = createnotify};
+static struct wl_listener pointer_constraint_create = {.notify = createpointerconstraint};
 static struct wl_listener new_layer_shell_surface = {.notify = createlayersurface};
 static struct wl_listener output_mgr_apply = {.notify = outputmgrapply};
 static struct wl_listener output_mgr_test = {.notify = outputmgrtest};
@@ -375,6 +397,14 @@ static Atom netatom[NetLast];
 
 /* attempt to encapsulate suck into one file */
 #include "client.h"
+
+struct Pertag {
+	unsigned int curtag, prevtag; /* current and previous tag */
+	int nmasters[LENGTH(tags) + 1]; /* number of windows in master area */
+	float mfacts[LENGTH(tags) + 1]; /* mfacts per tag */
+	unsigned int sellts[LENGTH(tags) + 1]; /* selected layouts */
+	const Layout *ltidxs[LENGTH(tags) + 1][2]; /* matrix of tags and layouts indexes  */
+};
 
 /* compile-time check if all tags fit into an unsigned int bit array. */
 struct NumTags { char limitexceeded[LENGTH(tags) > 31 ? -1 : 1]; };
@@ -818,6 +848,7 @@ createmon(struct wl_listener *listener, void *data)
 	struct wlr_output *wlr_output = data;
 	const MonitorRule *r;
 	Monitor *m = wlr_output->data = calloc(1, sizeof(*m));
+	unsigned int i;
 	m->wlr_output = wlr_output;
 
 	/* Initialize monitor state using configured rules */
@@ -854,6 +885,19 @@ createmon(struct wl_listener *listener, void *data)
 	wl_list_insert(&mons, &m->link);
 	printstatus();
 
+	m->pertag = calloc(1, sizeof(Pertag));
+	m->pertag->curtag = m->pertag->prevtag = 1;
+
+	for (i = 0; i <= LENGTH(tags); i++) {
+		m->pertag->nmasters[i] = m->nmaster;
+		m->pertag->mfacts[i] = m->mfact;
+
+		m->pertag->ltidxs[i][0] = m->lt[0];
+		m->pertag->ltidxs[i][1] = m->lt[1];
+		m->pertag->sellts[i] = m->sellt;
+	}
+
+
 	/* Adds this to the output layout in the order it was configured in.
 	 *
 	 * The output layout utility automatically adds a wl_output global to the
@@ -873,6 +917,28 @@ createmon(struct wl_listener *listener, void *data)
 						c->geom.width, c->geom.height, 0);
 		}
 		return;
+	}
+}
+
+void
+createpointerconstraint(struct wl_listener *listener, void *data)
+{
+	struct wlr_pointer_constraint_v1 *constraint = data;
+	struct pointer_constraint *pointer_constraint = calloc(1, sizeof(struct pointer_constraint));
+	pointer_constraint->constraint = constraint;
+	
+	pointer_constraint->destroy.notify = destroypointerconstraint;
+	wl_signal_add(&constraint->events.destroy, &pointer_constraint->destroy);
+	
+	if (client_surface(selclient()) == constraint->surface) {
+		if (allow_constrain == 0 || active_constraint == constraint)
+			return;
+
+		active_constraint = constraint;
+		wlr_pointer_constraint_v1_send_activated(constraint);
+
+		constraint_commit.notify = handleconstraintcommit;
+		wl_signal_add(&constraint->surface->events.commit, &constraint_commit);
 	}
 }
 
@@ -958,6 +1024,25 @@ createpointer(struct wlr_input_device *device)
 	 * opportunity to do libinput configuration on the device to set
 	 * acceleration, etc. */
 	wlr_cursor_attach_input_device(cursor, device);
+}
+
+void
+destroypointerconstraint(struct wl_listener *listener, void *data)
+{
+	struct wlr_pointer_constraint_v1 *constraint = data;
+	struct pointer_constraint *pointer_constraint = wl_container_of(listener, pointer_constraint, destroy);
+
+	wl_list_remove(&pointer_constraint->destroy.link);
+
+	if (active_constraint == constraint) {
+		if (constraint_commit.link.next != NULL) {
+			wl_list_remove(&constraint_commit.link);
+		}
+		wl_list_init(&constraint_commit.link);
+		active_constraint = NULL;
+	}
+
+	free(pointer_constraint);
 }
 
 void
@@ -1167,9 +1252,15 @@ focustop(Monitor *m)
 }
 
 void
+handleconstraintcommit(struct wl_listener *listener, void *data)
+{
+	assert(active_constraint->surface == data);
+}
+
+void
 incnmaster(const Arg *arg)
 {
-	selmon->nmaster = MAX(selmon->nmaster + arg->i, 0);
+	selmon->nmaster = selmon->pertag->nmasters[selmon->pertag->curtag] = MAX(selmon->nmaster + arg->i, 0);
 	arrange(selmon);
 }
 
@@ -1422,8 +1513,15 @@ motionrelative(struct wl_listener *listener, void *data)
 	 * special configuration applied for the specific input device which
 	 * generated the event. You can pass NULL for the device if you want to move
 	 * the cursor around without any input. */
-	wlr_cursor_move(cursor, event->device,
+	wlr_relative_pointer_manager_v1_send_relative_motion(
+		relative_pointer_manager,
+		seat, (uint64_t)event->time_msec * 1000,
+		event->delta_x, event->delta_y, event->unaccel_dx, event->unaccel_dy);
+
+	if (!active_constraint) {
+		wlr_cursor_move(cursor, event->device,
 			event->delta_x, event->delta_y);
+	}
 	motionnotify(event->time_msec);
 }
 
@@ -1909,9 +2007,9 @@ void
 setlayout(const Arg *arg)
 {
 	if (!arg || !arg->v || arg->v != selmon->lt[selmon->sellt])
-		selmon->sellt ^= 1;
+		selmon->sellt = selmon->pertag->sellts[selmon->pertag->curtag] ^= 1;
 	if (arg && arg->v)
-		selmon->lt[selmon->sellt] = (Layout *)arg->v;
+		selmon->lt[selmon->sellt] = selmon->pertag->ltidxs[selmon->pertag->curtag][selmon->sellt] = (Layout *)arg->v;
 	/* TODO change layout symbol? */
 	arrange(selmon);
 	printstatus();
@@ -1928,7 +2026,7 @@ setmfact(const Arg *arg)
 	f = arg->f < 1.0 ? arg->f + selmon->mfact : arg->f - 1.0;
 	if (f < 0.1 || f > 0.9)
 		return;
-	selmon->mfact = f;
+	selmon->mfact = selmon->pertag->mfacts[selmon->pertag->curtag] = f;
 	arrange(selmon);
 }
 
@@ -2061,6 +2159,11 @@ setup(void)
 			wlr_server_decoration_manager_create(dpy),
 			WLR_SERVER_DECORATION_MANAGER_MODE_SERVER);
 	wlr_xdg_decoration_manager_v1_create(dpy);
+
+	pointer_constraints = wlr_pointer_constraints_v1_create(dpy);
+	wl_signal_add(&pointer_constraints->events.new_constraint, &pointer_constraint_create);
+	
+	relative_pointer_manager = wlr_relative_pointer_manager_v1_create(dpy);
 
 	/*
 	 * Creates a cursor, which is a wlroots utility for tracking the cursor
@@ -2254,9 +2357,30 @@ void
 toggleview(const Arg *arg)
 {
 	unsigned int newtagset = selmon->tagset[selmon->seltags] ^ (arg->ui & TAGMASK);
+	int i;
 
 	if (newtagset) {
 		selmon->tagset[selmon->seltags] = newtagset;
+
+		if (newtagset == ~0) {
+			selmon->pertag->prevtag = selmon->pertag->curtag;
+			selmon->pertag->curtag = 0;
+		}
+
+		/* test if the user did not select the same tag */
+		if (!(newtagset & 1 << (selmon->pertag->curtag - 1))) {
+			selmon->pertag->prevtag = selmon->pertag->curtag;
+			for (i = 0; !(newtagset & 1 << i); i++) ;
+			selmon->pertag->curtag = i + 1;
+		}
+
+		/* apply settings for this view */
+		selmon->nmaster = selmon->pertag->nmasters[selmon->pertag->curtag];
+		selmon->mfact = selmon->pertag->mfacts[selmon->pertag->curtag];
+		selmon->sellt = selmon->pertag->sellts[selmon->pertag->curtag];
+		selmon->lt[selmon->sellt] = selmon->pertag->ltidxs[selmon->pertag->curtag][selmon->sellt];
+		selmon->lt[selmon->sellt^1] = selmon->pertag->ltidxs[selmon->pertag->curtag][selmon->sellt^1];
+
 		focusclient(focustop(selmon), 1);
 		arrange(selmon);
 	}
@@ -2357,11 +2481,34 @@ urgent(struct wl_listener *listener, void *data)
 void
 view(const Arg *arg)
 {
+	int i;
+	unsigned int tmptag;
+
 	if ((arg->ui & TAGMASK) == selmon->tagset[selmon->seltags])
 		return;
 	selmon->seltags ^= 1; /* toggle sel tagset */
-	if (arg->ui & TAGMASK)
+	if (arg->ui & TAGMASK) {
 		selmon->tagset[selmon->seltags] = arg->ui & TAGMASK;
+		selmon->pertag->prevtag = selmon->pertag->curtag;
+
+		if (arg->ui == ~0)
+			selmon->pertag->curtag = 0;
+		else {
+			for (i = 0; !(arg->ui & 1 << i); i++) ;
+			selmon->pertag->curtag = i + 1;
+		}
+	} else {
+		tmptag = selmon->pertag->prevtag;
+		selmon->pertag->prevtag = selmon->pertag->curtag;
+		selmon->pertag->curtag = tmptag;
+	}
+
+	selmon->nmaster = selmon->pertag->nmasters[selmon->pertag->curtag];
+	selmon->mfact = selmon->pertag->mfacts[selmon->pertag->curtag];
+	selmon->sellt = selmon->pertag->sellts[selmon->pertag->curtag];
+	selmon->lt[selmon->sellt] = selmon->pertag->ltidxs[selmon->pertag->curtag][selmon->sellt];
+	selmon->lt[selmon->sellt^1] = selmon->pertag->ltidxs[selmon->pertag->curtag][selmon->sellt^1];
+
 	focusclient(focustop(selmon), 1);
 	arrange(selmon);
 	printstatus();
@@ -2591,7 +2738,7 @@ xytoindependent(double x, double y)
 int
 main(int argc, char *argv[])
 {
-	char *startup_cmd = NULL;
+	char *startup_cmd = "swaybg -i ~/.wallpaper.png; export QT_QPA_PLATFORMTHEME=qt5ct; export GTK_THEME=Breeze:dark;";
 	int c;
 
 	while ((c = getopt(argc, argv, "s:h")) != -1) {
